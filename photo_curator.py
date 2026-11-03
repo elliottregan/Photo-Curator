@@ -34,17 +34,16 @@ from pathlib import Path
 from dataclasses import dataclass
 from urllib.parse import quote
 
-import cv2
 import numpy as np
 from flask import Flask, render_template_string, request, jsonify, send_file, abort
 from PIL import Image, ImageOps
 
 from raw_loader import (RAW_EXTS, HAS_RAWPY, is_raw,
                         HEIF_EXTS, HAS_HEIF, is_heif, needs_jpeg_preview,
-                        open_image_pil, imread_bgr, imread_gray)
-from photo_ranking_v3 import AdvancedPhotoAnalyzer
+                        open_image_pil)
 from photo_dedup_batch import FastBatchDeduplicator
 from photo_file_organizer import PhotoOrganizer
+import fast_pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -208,6 +207,9 @@ state = {
     'dedup': {**_blank(), 'groups': 0, 'kept_paths': []},
     'rank':  {**_blank(), 'scores': [], 'total': 0, 'analyzed': 0},
 }
+
+# One process pool + per-photo result cache shared by Cull, Dedup and Rank.
+ANALYZER = fast_pipeline.Analyzer()
 
 
 # --------------------------------------------------------------------------- #
@@ -470,61 +472,8 @@ def native_folder_dialog(prompt="Select a folder"):
 
 
 # --------------------------------------------------------------------------- #
-#  Sharpness (shared by Cull, and as the dedup quality key)
+#  Sharpness (shared by Cull, and as the dedup quality key) — see frame_metrics
 # --------------------------------------------------------------------------- #
-def sharpness_score(gray):
-    """Whole-frame contrast-normalized focus measure (used by Dedup's quality
-    key). Haze/low contrast does NOT read as blur."""
-    h, w = gray.shape[:2]
-    long_edge = max(h, w)
-    if long_edge > 1024:
-        sc = 1024.0 / long_edge
-        gray = cv2.resize(gray, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
-    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    img_var = float(gray.astype('float32').var()) + 1e-6
-    return lap_var / img_var * 1000.0
-
-
-def region_sharpness(gray, tiles=8):
-    """REGION-based sharpness for Cull: tile the frame, score each tile's
-    contrast-normalized focus, and return a high percentile. This measures the
-    SHARPEST meaningful region, so a tack-sharp subject against soft bokeh/sky
-    is correctly recognized as in-focus instead of being dragged down by the
-    smooth background (the key v3.1 accuracy fix)."""
-    h, w = gray.shape[:2]
-    long_edge = max(h, w)
-    if long_edge > 1024:
-        sc = 1024.0 / long_edge
-        gray = cv2.resize(gray, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
-    lap = cv2.Laplacian(gray, cv2.CV_64F)          # uint8 -> CV_64F (supported)
-    g = gray.astype('float32')
-    H, W = g.shape
-    th, tw = max(1, H // tiles), max(1, W // tiles)
-    scores = []
-    for y in range(0, H, th):
-        for x in range(0, W, tw):
-            tg = g[y:y + th, x:x + tw]
-            if tg.size < 64:
-                continue
-            v = float(tg.var()) + 1e-6
-            scores.append(float(lap[y:y + th, x:x + tw].var()) / v * 1000.0)
-    if not scores:
-        return 0.0
-    return float(np.percentile(np.array(scores), 90))
-
-
-def quick_quality(bgr, gray):
-    """Lightweight 0–100 'is this an interesting, detailed frame' proxy used
-    only to RESCUE soft-but-well-composed shots from culling. Cheap on purpose;
-    the real aesthetic judgement happens in the Rank step."""
-    edges = cv2.Canny(gray, 60, 160)
-    ed = float(np.count_nonzero(edges)) / edges.size
-    contrast = float(gray.std())
-    b, gg, r = (bgr[:, :, i].astype('float32') for i in range(3))
-    rg, yb = r - gg, 0.5 * (r + gg) - b
-    cf = (rg.std() ** 2 + yb.std() ** 2) ** 0.5 + 0.3 * (rg.mean() ** 2 + yb.mean() ** 2) ** 0.5
-    q = 0.5 * min(1, ed / 0.12) + 0.25 * min(1, contrast / 70) + 0.25 * min(1, cf / 80)
-    return float(max(0.0, min(1.0, q)) * 100)
 
 
 def classify_sharpness(region_s, q, blur_lo, sharp_hi, q_rescue, rescue_on):
@@ -631,28 +580,35 @@ def run_cull(folder, strictness, adaptive, rescue_on):
                     f"Soft {s['soft']} ({s['soft']/k*100:.0f}%) / "
                     f"Blurry {s['blurry']} ({s['blurry']/k*100:.0f}%)")
 
-        for idx, p in enumerate(images):
-            if s.get('cancel'):
-                classify_all()
-                s['status'] = (f"Stopped at {idx}/{total} · {_tiers(idx)} · "
-                               f"elapsed {_fmt(time.time()-t0)}")
-                return
-            done = idx + 1
-            s['progress'] = int(done / total * 100)
+        # Photos are analyzed in parallel (fast_pipeline), which also computes
+        # everything Dedup and Rank need — those steps then reuse it.
+        done = [0]
+
+        def on_result(idx, r):
+            done[0] += 1
+            n = done[0]
+            name = Path(r['path']).name
+            if r['ok']:
+                items.append({'idx': idx, 'name': name, 'path': r['path'],
+                              'region_s': r['region_s'], 'q': r['q']})
+            s['progress'] = int(n / total * 100)
             elapsed = time.time() - t0
-            rate = done / elapsed if elapsed > 0 else 0
-            eta = (total - done) / rate if rate > 0 else 0
-            s['status'] = (f"Culling {p.name} ({done}/{total}, {done/total*100:.0f}%) · "
-                           f"{_tiers(done)} · elapsed {_fmt(elapsed)} · ETA {_fmt(eta)}")
-            bgr = imread_bgr(str(p))       # RAW-aware
-            if bgr is None:
-                continue
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            items.append({'name': p.name, 'path': str(p),
-                          'region_s': region_sharpness(gray),
-                          'q': quick_quality(bgr, gray)})
-            if idx % 5 == 0 or idx == len(images) - 1:
+            rate = n / elapsed if elapsed > 0 else 0
+            eta = (total - n) / rate if rate > 0 else 0
+            s['status'] = (f"Culling {name} ({n}/{total}, {n/total*100:.0f}%) · "
+                           f"{_tiers(n)} · elapsed {_fmt(elapsed)} · ETA {_fmt(eta)}")
+            if n % 5 == 0 or n == len(images):
                 classify_all()
+
+        finished = ANALYZER.run(images, on_result, cancelled=lambda: s.get('cancel'))
+        # Results arrive in completion order; restore capture (filename) order,
+        # which Dedup's clustering depends on.
+        items.sort(key=lambda it: it['idx'])
+        if not finished:
+            classify_all()
+            s['status'] = (f"Stopped at {done[0]}/{total} · {_tiers(done[0])} · "
+                           f"elapsed {_fmt(time.time()-t0)}")
+            return
         classify_all()
 
         # Blurry photos are NOT moved automatically — they stay in place so you
@@ -746,12 +702,9 @@ def run_dedup(folder, threshold, ftype='all', pair='both'):
             s['status'] = ('No images' if ftype == 'all'
                            else f'No {ftype_label(ftype)} images to dedup')
             return
+        # Signatures come from the shared ANALYZER cache, so the on-disk
+        # .dedup_sig_cache.json is no longer written into the photo folder.
         dd = FastBatchDeduplicator(threshold=threshold)
-        # Persist perceptual signatures so a repeat run on this folder is fast.
-        try:
-            dd.enable_disk_cache(Path(paths[0]).parent / '.dedup_sig_cache.json')
-        except Exception:
-            pass
         dd.reset()
         total = len(paths)
 
@@ -788,31 +741,42 @@ def run_dedup(folder, threshold, ftype='all', pair='both'):
             sec = int(max(0, sec)); h, r = divmod(sec, 3600); m, s_ = divmod(r, 60)
             return f"{h}h{m:02d}m" if h else (f"{m}m{s_:02d}s" if m else f"{s_}s")
 
-        for idx, p in enumerate(paths):
-            if s.get('cancel'):
-                refresh(final=True)
-                el = time.time() - t0
-                s['status'] = (f"Stopped · {len(dd.clusters)} unique of {idx} "
-                               f"({(len(dd.clusters)/idx*100) if idx else 0:.0f}%) · "
-                               f"elapsed {_fmt(el)}")
-                state['dedup']['kept_paths'] = [sc.path for sc in dd.current_survivors()]
-                return
-            done = idx + 1
+        # Analysis runs in parallel and finishes out of order, but clustering
+        # depends on order: each photo is clustered once every earlier photo
+        # has been, so the live grid fills in the same sequence as before.
+        pending, nxt, got = {}, [0], [0]
+
+        def on_result(idx, r):
+            got[0] += 1
+            pending[idx] = r
+            while nxt[0] in pending:
+                r = pending.pop(nxt[0])
+                nxt[0] += 1
+                fast_pipeline.prime_dedup(dd, r)
+                sharp = r['sharp'] if r['ok'] else 0.0
+                dd.add_photo(_LiteScore(r['path'], Path(r['path']).name, sharp, sharp))
+            done = got[0]
             s['progress'] = int(done / total * 100)
             uniq = len(dd.clusters)
-            pct_uniq = (uniq / done * 100) if done else 0
+            pct_uniq = (uniq / nxt[0] * 100) if nxt[0] else 0
             elapsed = time.time() - t0
             rate = done / elapsed if elapsed > 0 else 0          # photos/sec
             eta = (total - done) / rate if rate > 0 else 0
-            s['status'] = (f"Deduping {p.name} ({done}/{total}) · "
+            s['status'] = (f"Deduping {Path(r['path']).name} ({done}/{total}) · "
                            f"{uniq} unique ({pct_uniq:.0f}%) · "
                            f"elapsed {_fmt(elapsed)} · ETA {_fmt(eta)}")
-            gray = imread_gray(str(p))     # RAW-aware
-            sharp = sharpness_score(gray) if gray is not None else 0.0
-            dd.add_photo(_LiteScore(str(p), p.name, sharp, sharp))
-            if time.time() - last_refresh[0] >= REFRESH_SECS or idx == total - 1:
+            if time.time() - last_refresh[0] >= REFRESH_SECS:
                 refresh()
-        dd.save_disk_cache()
+
+        if not ANALYZER.run(paths, on_result, cancelled=lambda: s.get('cancel')):
+            refresh(final=True)
+            el = time.time() - t0
+            n = nxt[0]
+            s['status'] = (f"Stopped · {len(dd.clusters)} unique of {n} "
+                           f"({(len(dd.clusters)/n*100) if n else 0:.0f}%) · "
+                           f"elapsed {_fmt(el)}")
+            state['dedup']['kept_paths'] = [sc.path for sc in dd.current_survivors()]
+            return
         refresh(final=True)
         kept = [sc.path for sc in dd.current_survivors()]
         s['kept_paths'] = kept
@@ -914,30 +878,31 @@ def run_rank(folder, ftype='all', pair='both'):
             return
         total = len(paths)
         s['total'] = total
-        analyzer = AdvancedPhotoAnalyzer()
-
         t0 = time.time()
 
         def _fmt(sec):
             sec = int(max(0, sec)); h, r = divmod(sec, 3600); m, s_ = divmod(r, 60)
             return f"{h}h{m:02d}m" if h else (f"{m}m{s_:02d}s" if m else f"{s_}s")
 
-        for idx, p in enumerate(paths):
-            if s.get('cancel'):
-                s['status'] = (f"Stopped at {idx}/{total} · ranked {len(s['scores'])} so far · "
-                               f"elapsed {_fmt(time.time()-t0)}")
-                return
-            done = idx + 1
-            s['progress'] = int(done / total * 100)
+        done = [0]
+
+        def on_result(idx, r):
+            done[0] += 1
+            n = done[0]
+            s['progress'] = int(n / total * 100)
             elapsed = time.time() - t0
-            rate = done / elapsed if elapsed > 0 else 0
-            eta = (total - done) / rate if rate > 0 else 0
-            s['status'] = (f"Ranking {p.name} ({done}/{total}, {done/total*100:.0f}%) · "
+            rate = n / elapsed if elapsed > 0 else 0
+            eta = (total - n) / rate if rate > 0 else 0
+            s['status'] = (f"Ranking {Path(r['path']).name} ({n}/{total}, {n/total*100:.0f}%) · "
                            f"elapsed {_fmt(elapsed)} · ETA {_fmt(eta)}")
-            sc = analyzer.analyze_image(str(p))
-            if sc:
-                s['scores'].append(sc)
+            if r['ok'] and r['rank'] is not None:
+                s['scores'].append(r['rank'])
             s['analyzed'] = len(s['scores'])
+
+        if not ANALYZER.run(paths, on_result, cancelled=lambda: s.get('cancel')):
+            s['status'] = (f"Stopped at {done[0]}/{total} · ranked {len(s['scores'])} so far · "
+                           f"elapsed {_fmt(time.time()-t0)}")
+            return
         s['progress'] = 100
         s['status'] = f"Done · ranked {len(s['scores'])} {chain} · elapsed {_fmt(time.time()-t0)}"
     except Exception as e:
